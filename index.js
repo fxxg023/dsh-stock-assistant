@@ -1,0 +1,653 @@
+// dsh-stock-assistant 插件入口：注册行情/热点/分析/自选股/资金流/选股/回测/盯盘工具。
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { quote, sectorList, limitUpPool, stockFlow, screenTop, lastTradingDates } from './src/eastmoney.js'
+import { kline } from './src/tencent.js'
+import * as ind from './src/indicators.js'
+import { backtest, strategySignals, strategyStates } from './src/quant.js'
+import { runAkshare } from './src/akshare.js'
+import { stockNews } from './src/news.js'
+import { startWatcher } from './src/watch.js'
+import { createStore } from './src/store.js'
+import { NS, DEFAULT_CONFIG, ConfigSchema, mergeConfig } from './src/config.js'
+import { fmtAmount, fmtPct } from './src/http.js'
+
+export const name = 'dsh-stock-assistant'
+export const inject = ['tools']
+
+export function apply(ctx) {
+  const store = createStore()
+
+  // ---------- 配置（settings 命名空间，供设置页读写） ----------
+  let config = { ...DEFAULT_CONFIG }
+  let settingsApi = null
+  // setSource 收到的是「返回当前配置的 thunk」；onChange 触发时求值并合并默认值。
+  let readSource = () => config
+  const getConfig = () => config
+  const updateConfig = async (patch) => {
+    if (settingsApi) { await settingsApi.update(NS, patch); return }
+    config = mergeConfig({ ...config, ...patch })
+  }
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsApi = settingsCtx.settings
+    // SettingsSectionHooks 强制要求 setSource + onChange：缺 onChange 会在
+    // installSection 内抛 TypeError，且（settings 服务代理把副作用绑定到调用方
+    // fiber）该子 fiber 失败会把命名空间注册回滚 —— 设置页因此永远派发不出卡片。
+    settingsCtx.settings.installSection(ctx, NS, ConfigSchema, DEFAULT_CONFIG, {
+      setSource: (current) => { readSource = current },
+      onChange: () => { config = mergeConfig(readSource()) },
+    })
+  })
+
+  startWatcher(ctx, store, { quoteFn: quote, klineFn: kline, getConfig })
+
+  // ---------- 实时行情 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_quote',
+    description: '查询 A 股实时行情：最新价、涨跌幅、开盘/最高/最低/昨收、成交量额、换手率、市盈率、市净率、总市值/流通市值。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码，如 600000、000001、300750' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderQuote(v) }],
+    },
+    execute: async (args) => quote(String(args.code).trim()),
+    timeoutMs: 15000,
+  }))
+
+  // ---------- K 线 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_kline',
+    description: '查询 A 股历史 K 线（前复权）。period 支持 day/week/month（分钟级暂不保证）。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+      period: { type: 'string', enum: ['day', 'week', 'month'], description: '周期，默认 day' },
+      count: { type: 'integer', description: '返回根数，默认 60，最大 250' },
+    },
+    output: {
+      schema: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      render: (_a, v) => [{ type: 'text', text: renderKline(v) }],
+    },
+    execute: async (args) => {
+      const count = Math.max(1, Math.min(args.count ?? 60, 250))
+      return kline(String(args.code).trim(), { period: args.period ?? 'day', count, fq: 'qfq' })
+    },
+    timeoutMs: 15000,
+  }))
+
+  // ---------- 技术指标 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_indicators',
+    description: '计算 A 股技术指标（基于前复权日线）：MA5/10/20/60、MACD、RSI(14)、KDJ(9)、BOLL(20,2)，返回最新一根的值。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderIndicators(v) }],
+    },
+    execute: async (args) => {
+      const bars = await kline(String(args.code).trim(), { period: 'day', count: 120, fq: 'qfq' })
+      if (bars.length < 30) throw new Error('K 线数据不足（<30 根）')
+      const closes = bars.map((b) => b.close)
+      const highs = bars.map((b) => b.high)
+      const lows = bars.map((b) => b.low)
+      const last = bars.length - 1
+      const ma5 = ind.sma(closes, 5)
+      const ma10 = ind.sma(closes, 10)
+      const ma20 = ind.sma(closes, 20)
+      const ma60 = ind.sma(closes, 60)
+      const { dif, dea, hist } = ind.macd(closes)
+      const rsi14 = ind.rsi(closes, 14)
+      const { k, d, j } = ind.kdj(highs, lows, closes, 9)
+      const { mid, up, low } = ind.boll(closes, 20, 2)
+      return {
+        code: String(args.code).trim(),
+        date: bars[last].date,
+        close: closes[last],
+        ma: { ma5: ma5[last], ma10: ma10[last], ma20: ma20[last], ma60: ma60[last] },
+        macd: { dif: dif[last], dea: dea[last], hist: hist[last] },
+        rsi: rsi14[last],
+        kdj: { k: k[last], d: d[last], j: j[last] },
+        boll: { up: up[last], mid: mid[last], low: low[last] },
+      }
+    },
+    timeoutMs: 15000,
+  }))
+
+  // ---------- 板块排名 ----------
+  ctx.tools.register(defineTool({
+    name: 'sector_rank',
+    description: '行业/概念/地域板块涨跌幅排名（含上涨家数、下跌家数）。用于筛选当日强势/弱势板块。',
+    parameters: {
+      type: { type: 'string', enum: ['industry', 'concept', 'region'], description: '板块类型：industry 行业 / concept 概念 / region 地域，默认 industry' },
+      limit: { type: 'integer', description: '返回数量，默认 20，最大 100' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderSector(v) }],
+    },
+    execute: async (args) => {
+      const limit = Math.max(1, Math.min(args.limit ?? 20, 100))
+      const list = await sectorList({ type: args.type ?? 'industry', sort: 'pct', limit })
+      return { type: args.type ?? 'industry', sort: 'pct', list }
+    },
+    timeoutMs: 15000,
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'sector_flow',
+    description: '行业/概念/地域板块主力资金净流入排名，用于识别主力资金流向的热点板块。',
+    parameters: {
+      type: { type: 'string', enum: ['industry', 'concept', 'region'], description: '板块类型，默认 industry' },
+      limit: { type: 'integer', description: '返回数量，默认 20，最大 100' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderSector(v) }],
+    },
+    execute: async (args) => {
+      const limit = Math.max(1, Math.min(args.limit ?? 20, 100))
+      const list = await sectorList({ type: args.type ?? 'industry', sort: 'flow', limit })
+      return { type: args.type ?? 'industry', sort: 'flow', list }
+    },
+    timeoutMs: 15000,
+  }))
+
+  // ---------- 涨停板池 ----------
+  ctx.tools.register(defineTool({
+    name: 'limit_up_pool',
+    description: '获取最近交易日的涨停板池：涨停股代码/名称/连板数/首次封板时间/封单金额/炸板次数/所属行业。用于短线热点情绪分析。',
+    parameters: {
+      date: { type: 'string', description: '可选，YYYYMMDD 格式的交易日；缺省自动取最近交易日' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderLimitUp(v) }],
+    },
+    execute: async (args) => limitUpPool({ date: args.date, limit: 200 }),
+    timeoutMs: 20000,
+  }))
+
+  // ---------- 自选股 ----------
+  ctx.tools.register(defineTool({
+    name: 'watchlist_add',
+    description: '添加股票到自选股（持久化）。若不传 name 会自动查询行情补全名称。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+      name: { type: 'string', description: '股票名称（可选，缺省自动查询）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderWatchlist(v) }],
+    },
+    execute: async (args) => {
+      const code = String(args.code).trim()
+      let name = args.name ? String(args.name).trim() : ''
+      if (!name) {
+        try { name = (await quote(code)).name } catch { name = code }
+      }
+      const list = [...(getConfig().watchlist || [])]
+      if (!list.some((w) => w.code === code)) {
+        list.push({ code, name })
+        await updateConfig({ watchlist: list })
+        return { action: 'added', code, name, list }
+      }
+      return { action: 'exists', code, name, list }
+    },
+    timeoutMs: 15000,
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'watchlist_remove',
+    description: '从自选股移除指定股票。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderWatchlist(v) }],
+    },
+    execute: async (args) => {
+      const code = String(args.code).trim()
+      const list = (getConfig().watchlist || []).filter((w) => w.code !== code)
+      await updateConfig({ watchlist: list })
+      return { action: 'removed', code, list }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'watchlist_show',
+    description: '查看当前自选股列表，并附每只股票的实时涨跌幅。',
+    parameters: {},
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderWatchlist(v) }],
+    },
+    execute: async () => {
+      const list = getConfig().watchlist || []
+      const items = []
+      for (const w of list) {
+        try {
+          const q = await quote(w.code)
+          items.push({ code: w.code, name: w.name || q.name, price: q.price, changePct: q.changePct })
+        } catch {
+          items.push({ code: w.code, name: w.name || w.code, price: null, changePct: null })
+        }
+      }
+      return { list: items }
+    },
+    timeoutMs: 20000,
+  }))
+
+  // ---------- 个股资金流 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_flow',
+    description: '查询 A 股个股资金流向：主力/超大单/大单/中单/小单净流入（历史日线）。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+      days: { type: 'integer', description: '返回近 N 个交易日，默认 10，最大 60' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderFlow(v) }] },
+    execute: async (args) => stockFlow(String(args.code).trim(), args.days ?? 10),
+    timeoutMs: 15000,
+  }))
+
+  // ---------- 龙虎榜 ----------
+  ctx.tools.register(defineTool({
+    name: 'dragon_tiger',
+    description: '查询龙虎榜（游资/机构席位），按净买额降序。date 缺省取最近交易日。',
+    parameters: {
+      date: { type: 'string', description: '可选，YYYYMMDD 交易日；缺省取最近交易日' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderLhb(v) }] },
+    execute: async (args) => {
+      const dates = args.date ? [args.date] : lastTradingDates(7)
+      let lastErr = null
+      for (const d of dates) {
+        try {
+          const list = await runAkshare('lhb', { start: d, end: d }, 30000)
+          if (Array.isArray(list) && list.length > 0) return { date: d, list }
+        } catch (e) { lastErr = e }
+      }
+      if (lastErr) throw lastErr
+      return { date: args.date || dates[0], list: [] }
+    },
+    timeoutMs: 40000,
+  }))
+
+  // ---------- 个股新闻 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_news',
+    description: '查询个股相关新闻资讯（东方财富）：标题、时间、来源、摘要、链接。用于分析消息面/催化剂。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+      limit: { type: 'integer', description: '返回条数，默认 10，最大 30' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderNews(v) }] },
+    execute: async (args) => stockNews(String(args.code).trim(), args.limit ?? 10),
+    timeoutMs: 20000,
+  }))
+
+  // ---------- 财务摘要 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_finance',
+    description: '查询 A 股财务摘要：归母净利润、营收、每股收益、ROE、毛利率、资产负债率等关键指标（最近 4 期）。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderFinance(v) }] },
+    execute: async (args) => {
+      const code = String(args.code).trim()
+      const data = await runAkshare('finance_abstract', { code }, 30000)
+      return { code, ...data }
+    },
+    timeoutMs: 40000,
+  }))
+
+  // ---------- 条件选股 ----------
+  ctx.tools.register(defineTool({
+    name: 'screen',
+    description: '条件选股：按涨跌幅/换手率/市盈率/市净率/主力净流入/总市值等对全市场排序取前 100 名，再叠加筛选条件（换手/PE/PB/市值/主力净流入/行业/名称）过滤，返回前 limit 名。',
+    parameters: {
+      sortBy: { type: 'string', enum: ['changePct', 'turnover', 'pe', 'pb', 'mainInflow', 'totalMv', 'volumeRatio'], description: '排序字段，默认 changePct' },
+      order: { type: 'string', enum: ['desc', 'asc'], description: '排序方向，默认 desc' },
+      limit: { type: 'integer', description: '返回数量，默认 30，最大 100' },
+      minChangePct: { type: 'number', description: '涨跌幅下限（%）' },
+      maxChangePct: { type: 'number', description: '涨跌幅上限（%）' },
+      minTurnover: { type: 'number', description: '换手率下限（%）' },
+      maxPe: { type: 'number', description: '市盈率上限（剔除负值与超过此值的）' },
+      maxPb: { type: 'number', description: '市净率上限' },
+      minTotalMv: { type: 'number', description: '总市值下限（亿元）' },
+      maxTotalMv: { type: 'number', description: '总市值上限（亿元）' },
+      mainInflowPositive: { type: 'boolean', description: '只保留主力净流入为正' },
+      industry: { type: 'string', description: '行业名称关键字，如 半导体、军工' },
+      nameKeyword: { type: 'string', description: '股票名称关键字' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderScreen(v) }] },
+    execute: async (args) => {
+      const sortBy = args.sortBy || 'changePct'
+      const order = args.order || 'desc'
+      let rows = await screenTop({ sortBy, order, limit: 100 })
+      if (args.minChangePct != null) rows = rows.filter((r) => r.changePct != null && r.changePct >= args.minChangePct)
+      if (args.maxChangePct != null) rows = rows.filter((r) => r.changePct != null && r.changePct <= args.maxChangePct)
+      if (args.minTurnover != null) rows = rows.filter((r) => r.turnover != null && r.turnover >= args.minTurnover)
+      if (args.maxPe != null) rows = rows.filter((r) => r.pe != null && r.pe > 0 && r.pe <= args.maxPe)
+      if (args.maxPb != null) rows = rows.filter((r) => r.pb != null && r.pb > 0 && r.pb <= args.maxPb)
+      if (args.minTotalMv != null) rows = rows.filter((r) => r.totalMv != null && r.totalMv / 1e8 >= args.minTotalMv)
+      if (args.maxTotalMv != null) rows = rows.filter((r) => r.totalMv != null && r.totalMv / 1e8 <= args.maxTotalMv)
+      if (args.mainInflowPositive) rows = rows.filter((r) => r.mainInflow != null && r.mainInflow > 0)
+      if (args.industry) rows = rows.filter((r) => (r.industry || '').includes(args.industry))
+      if (args.nameKeyword) rows = rows.filter((r) => (r.name || '').includes(args.nameKeyword))
+      const limit = Math.max(1, Math.min(args.limit ?? 30, 100))
+      return { sortBy, order, matched: rows.length, list: rows.slice(0, limit) }
+    },
+    timeoutMs: 60000,
+  }))
+
+  // ---------- 回测 ----------
+  ctx.tools.register(defineTool({
+    name: 'backtest',
+    description: '策略回测（简化）：基于前复权日线全仓进出，输出收益/回撤/胜率（不含手续费滑点）。支持 6 种策略：均线金叉/死叉、MACD、RSI 超卖反弹、KDJ、N日突破、布林带回归。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+      strategy: { type: 'string', enum: ['ma_cross', 'macd_cross', 'rsi_reversal', 'kdj_cross', 'breakout', 'boll_reversal'], description: '策略，默认 ma_cross' },
+      fast: { type: 'integer', description: '快线参数（ma_cross），默认 5' },
+      slow: { type: 'integer', description: '慢线参数（ma_cross），默认 20' },
+      period: { type: 'integer', description: '周期参数（rsi 默认14 / kdj 默认9 / breakout 与 boll 默认20）' },
+      oversold: { type: 'number', description: '超卖阈值（rsi_reversal），默认 30' },
+      overbought: { type: 'number', description: '超买阈值（rsi_reversal），默认 70' },
+      count: { type: 'integer', description: '回测 K 线根数，默认 250，最大 800' },
+      initialCapital: { type: 'number', description: '初始资金，默认 100000' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderBacktest(v) }] },
+    execute: async (args) => {
+      const code = String(args.code).trim()
+      const cfg = getConfig()
+      const strategy = args.strategy ?? 'ma_cross'
+      const periodByStrategy = { rsi_reversal: cfg.rsiPeriod, kdj_cross: cfg.kdjPeriod, breakout: cfg.breakoutPeriod, boll_reversal: cfg.bollPeriod }
+      const count = Math.max(40, Math.min(args.count ?? cfg.backtestCount, 800))
+      const bars = await kline(code, { period: 'day', count, fq: 'qfq' })
+      return { code, ...backtest(bars, { strategy, fast: args.fast ?? cfg.maFast, slow: args.slow ?? cfg.maSlow, period: args.period ?? periodByStrategy[strategy], oversold: args.oversold ?? cfg.rsiOversold, overbought: args.overbought ?? cfg.rsiOverbought, initialCapital: args.initialCapital ?? cfg.initialCapital }) }
+    },
+    timeoutMs: 20000,
+  }))
+
+  // ---------- 策略信号 ----------
+  ctx.tools.register(defineTool({
+    name: 'strategy',
+    description: '个股多空信号仪表盘：综合均线/MACD/RSI/KDJ/BOLL 给出偏多/偏空/震荡判断，并列出 6 种交易策略（均线、MACD、RSI、KDJ、突破、布林）的当前状态。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderStrategy(v) }] },
+    execute: async (args) => {
+      const code = String(args.code).trim()
+      const bars = await kline(code, { period: 'day', count: 120, fq: 'qfq' })
+      return { code, ...strategySignals(bars), states: strategyStates(bars) }
+    },
+    timeoutMs: 20000,
+  }))
+
+  // ---------- 盯盘 ----------
+  ctx.tools.register(defineTool({
+    name: 'watch_start',
+    description: '开始盯盘：后台每 30 秒轮询自选股，触发涨跌幅异动/涨停跌停/放量告警并写入本地日志（用 watch_alerts 查看）。',
+    parameters: {
+      changePctThreshold: { type: 'number', description: '涨跌幅异动阈值（%），默认 3' },
+      volumeRatio: { type: 'number', description: '放量倍数（相对 5 日均量），默认 2' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderWatch(v) }] },
+    execute: async (args) => {
+      const cfg = getConfig()
+      if (args.changePctThreshold != null || args.volumeRatio != null) {
+        await updateConfig({ watchChangePct: args.changePctThreshold ?? cfg.watchChangePct, watchVolumeRatio: args.volumeRatio ?? cfg.watchVolumeRatio })
+      }
+      store.setWatch({ enabled: true })
+      const c2 = getConfig()
+      return { enabled: true, rules: { changePctThreshold: c2.watchChangePct, volumeRatio: c2.watchVolumeRatio }, watchlistCount: (c2.watchlist || []).length, note: '盯盘已开启，告警写入本地日志，可用 watch_alerts 查看' }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'watch_stop',
+    description: '停止盯盘。',
+    parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderWatch(v) }] },
+    execute: async () => {
+      const watch = store.getWatch()
+      watch.enabled = false
+      store.setWatch(watch)
+      return { enabled: false, note: '盯盘已停止' }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'watch_status',
+    description: '查看盯盘状态：是否开启、告警规则、自选股数量、累计告警数。',
+    parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderWatch(v) }] },
+    execute: async () => {
+      const watch = store.getWatch()
+      const cfg = getConfig()
+      return { enabled: watch.enabled, rules: { changePctThreshold: cfg.watchChangePct, volumeRatio: cfg.watchVolumeRatio }, watchlistCount: (cfg.watchlist || []).length, alertCount: store.getAlerts(999).length }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'watch_alerts',
+    description: '查看盯盘告警日志（最近触发的异动）。',
+    parameters: {
+      limit: { type: 'integer', description: '返回数量，默认 30，最大 200' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderAlerts(v) }] },
+    execute: async (args) => ({ alerts: store.getAlerts(Math.max(1, Math.min(args.limit ?? 30, 200))) }),
+  }))
+
+  console.log('[dsh-stock-assistant] 已注册工具: stock_quote, stock_kline, stock_indicators, sector_rank, sector_flow, limit_up_pool, watchlist_add, watchlist_remove, watchlist_show, stock_flow, dragon_tiger, stock_news, stock_finance, screen, backtest, strategy, watch_start, watch_stop, watch_status, watch_alerts')
+}
+
+// ---------------- render helpers ----------------
+
+function renderQuote(v) {
+  const lines = []
+  lines.push(`${v.name}(${v.code})  ${v.price}  ${fmtPct(v.changePct)}  (${v.change > 0 ? '+' : ''}${v.change})`)
+  lines.push(`今开 ${v.open}  最高 ${v.high}  最低 ${v.low}  昨收 ${v.prevClose}`)
+  lines.push(`振幅 ${fmtPct(v.amplitude)}  换手 ${fmtPct(v.turnover)}  量 ${v.volume}手  额 ${fmtAmount(v.amount)}`)
+  lines.push(`市盈率(动) ${v.pe ?? '—'}  市净率 ${v.pb ?? '—'}`)
+  lines.push(`总市值 ${fmtAmount(v.totalMv)}  流通市值 ${fmtAmount(v.floatMv)}`)
+  return lines.join('\n')
+}
+
+function renderKline(bars) {
+  const head = `共 ${bars.length} 根（前复权）：日期 / 开 / 收 / 高 / 低 / 量`
+  const rows = bars.map((b) =>
+    `${b.date}  开${b.open}  收${b.close}  高${b.high}  低${b.low}  量${b.volume}`
+  )
+  return [head, ...rows].join('\n')
+}
+
+function renderIndicators(v) {
+  const m = v.ma
+  const ma = m.ma60 != null
+    ? `MA5 ${m.ma5}  MA10 ${m.ma10}  MA20 ${m.ma20}  MA60 ${m.ma60}`
+    : `MA5 ${m.ma5}  MA10 ${m.ma10}  MA20 ${m.ma20}`
+  const trend = m.ma20 != null ? (v.close >= m.ma20 ? '收盘价在 MA20 上方' : '收盘价在 MA20 下方') : ''
+  const lines = [
+    `${v.code}  最新收盘 ${v.close}（${v.date}）`,
+    ma,
+    `MACD  DIF ${v.macd.dif}  DEA ${v.macd.dea}  MACD柱 ${v.macd.hist}  (${v.macd.dif > v.macd.dea ? '金叉/多头' : '死叉/空头'})`,
+    `RSI(14) ${v.rsi}  KDJ  K${v.kdj.k} D${v.kdj.d} J${v.kdj.j}`,
+    `BOLL  上轨 ${v.boll.up}  中轨 ${v.boll.mid}  下轨 ${v.boll.low}`,
+  ]
+  if (trend) lines.push(trend)
+  lines.push('注：以上为技术指标数值，仅作参考，不构成投资建议。')
+  return lines.join('\n')
+}
+
+function renderSector(v) {
+  const label = { industry: '行业', concept: '概念', region: '地域' }[v.type] || v.type
+  const sortLabel = v.sort === 'flow' ? '主力净流入' : '涨跌幅'
+  const lines = [`${label}板块按${sortLabel}排名（共 ${v.list.length}）：`]
+  v.list.forEach((s, i) => {
+    const flow = s.mainNetInflow != null ? `${s.mainNetInflow >= 0 ? '+' : ''}${fmtAmount(s.mainNetInflow)}` : '—'
+    lines.push(`${i + 1}. ${s.name}  涨跌 ${fmtPct(s.changePct)}  涨${s.upCount}家/跌${s.downCount}家  主力净流入 ${flow}`)
+  })
+  return lines.join('\n')
+}
+
+function renderLimitUp(v) {
+  const lines = [`涨停板池（${v.date}，共 ${v.total} 只）：`]
+  v.pool.forEach((p, i) => {
+    lines.push(`${i + 1}. ${p.name}(${p.code})  连板${p.streak}  首次封板${p.firstSeal}  封单${fmtAmount(p.sealAmount)}  炸板${p.breakCount}次  ${p.industry || ''}`)
+  })
+  if (v.total === 0) lines.push('（当日无涨停数据）')
+  return lines.join('\n')
+}
+
+function renderWatchlist(v) {
+  if (v.action) {
+    const msg = { added: '已加入自选股', exists: '已在自选股中', removed: '已从自选股移除' }[v.action] || v.action
+    const codes = (v.list || []).map((w) => `${w.name}(${w.code})`).join('、')
+    return `${msg}：${v.code ? v.code : ''}\n当前自选股（${(v.list || []).length}）：${codes}`
+  }
+  const lines = [`自选股（共 ${v.list.length}）：`]
+  v.list.forEach((w, i) => {
+    const p = w.price != null ? `  ${w.price}  ${fmtPct(w.changePct)}` : ''
+    lines.push(`${i + 1}. ${w.name}(${w.code})${p}`)
+  })
+  return lines.join('\n')
+}
+
+function renderFlow(v) {
+  const sign = (n) => (n >= 0 ? '+' : '')
+  const lines = [`${v.name}(${v.code}) 资金流向（近 ${v.list.length} 日）：`]
+  v.list.forEach((x) => {
+    lines.push(`${x.date}  主力${sign(x.main)}${fmtAmount(x.main)}  超大${sign(x.superLarge)}${fmtAmount(x.superLarge)}  大${sign(x.large)}${fmtAmount(x.large)}  中${sign(x.medium)}${fmtAmount(x.medium)}  小${sign(x.small)}${fmtAmount(x.small)}`)
+  })
+  lines.push(`近 ${v.list.length} 日主力累计净流入：${sign(v.totalMain)}${fmtAmount(v.totalMain)}`)
+  return lines.join('\n')
+}
+
+function renderLhb(v) {
+  const lines = [`龙虎榜（${v.date}，共 ${v.list.length} 条，按净买额降序）：`]
+  v.list.forEach((x, i) => {
+    const net = x.netBuy != null ? (x.netBuy >= 0 ? '+' : '') + fmtAmount(x.netBuy) : '—'
+    lines.push(`${i + 1}. ${x.name}(${x.code})  涨跌${fmtPct(x.changePct)}  净买额${net}  ${x.reason || ''}`)
+  })
+  if (v.list.length === 0) lines.push('（当日无龙虎榜数据）')
+  return lines.join('\n')
+}
+
+function renderNews(v) {
+  const lines = [`${v.name || ''}(${v.code}) 相关新闻（检索词：${v.keyword}，共 ${v.list.length} 条）：`]
+  v.list.forEach((a, i) => {
+    lines.push(`${i + 1}. [${a.date}] ${a.title}（${a.source}）`)
+    if (a.content) lines.push(`   ${a.content}`)
+    if (a.url) lines.push(`   ${a.url}`)
+  })
+  if (v.list.length === 0) lines.push('（无相关新闻）')
+  return lines.join('\n')
+}
+
+function renderFinance(v) {
+  const periods = v.periods || []
+  const lines = [`${v.code} 财务摘要（最近 ${periods.length} 期）：`]
+  lines.push('指标 | ' + periods.map((p) => p.slice(0, 6)).join(' | '))
+  for (const row of (v.indicators || [])) {
+    const vals = periods.map((p) => {
+      const val = row[p]
+      if (val == null) return '—'
+      if (Math.abs(val) >= 1e8) return fmtAmount(val)
+      if (Math.abs(val) >= 1e4) return (val / 1e4).toFixed(2) + '万'
+      return Number(val).toFixed(2)
+    }).join(' | ')
+    lines.push(`${row.indicator} | ${vals}`)
+  }
+  return lines.join('\n')
+}
+
+function renderScreen(v) {
+  const labels = { changePct: '涨跌幅', turnover: '换手率', pe: '市盈率', pb: '市净率', mainInflow: '主力净流入', totalMv: '总市值', volumeRatio: '量比' }
+  const lines = [`条件选股结果：全市场按${labels[v.sortBy] || v.sortBy}${v.order === 'asc' ? '升序' : '降序'}前 100 名内，匹配 ${v.matched} 只，取前 ${v.list.length}：`]
+  v.list.forEach((s, i) => {
+    const inflow = s.mainInflow != null ? (s.mainInflow >= 0 ? '+' : '') + fmtAmount(s.mainInflow) : '—'
+    lines.push(`${i + 1}. ${s.name}(${s.code})  涨跌${fmtPct(s.changePct)}  换手${s.turnover ?? '—'}%  PE${s.pe ?? '—'}  主力${inflow}  市值${s.totalMv != null ? fmtAmount(s.totalMv) : '—'}  ${s.industry || ''}`)
+  })
+  if (v.list.length === 0) lines.push('（无匹配标的）')
+  return lines.join('\n')
+}
+
+function renderBacktest(v) {
+  const names = {
+    ma_cross: '均线金叉/死叉',
+    macd_cross: 'MACD 金叉/死叉',
+    rsi_reversal: 'RSI 超卖反弹',
+    kdj_cross: 'KDJ 金叉/死叉',
+    breakout: 'N日突破',
+    boll_reversal: '布林带回归',
+  }
+  const stratName = names[v.strategy] || v.strategy
+  const p = v.params || {}
+  let paramStr = ''
+  if (v.strategy === 'ma_cross') paramStr = `参数 ${p.fast}/${p.slow}`
+  else if (v.strategy === 'rsi_reversal') paramStr = `周期 ${p.period} 超卖${p.oversold}/超买${p.overbought}`
+  else if (v.strategy === 'kdj_cross' || v.strategy === 'breakout' || v.strategy === 'boll_reversal') paramStr = `周期 ${p.period}`
+  const lines = [
+    `${v.code} 回测结果（策略：${stratName}${paramStr ? '，' + paramStr : ''}，${v.bars} 根 K 线，初始 ${p.initialCapital}）`,
+    `期末权益 ${v.finalEquity}  总收益 ${v.totalReturn}%  年化 ${v.annualizedReturn}%`,
+    `最大回撤 ${v.maxDrawdown}%  交易 ${v.tradeCount} 次（${v.pairCount} 组买卖）  胜率 ${v.winRate}%`,
+  ]
+  const t = v.trades || []
+  const shown = t.slice(-12)
+  if (t.length > 12) lines.push(`……（共 ${t.length} 笔，显示最近 ${shown.length} 笔）`)
+  shown.forEach((x) => lines.push(`${x.type === 'buy' ? '买入' : '卖出'}  ${x.date}  @${x.price}`))
+  lines.push('注：简化回测，不含手续费/滑点，信号当日收盘成交，仅供参考。')
+  return lines.join('\n')
+}
+
+function renderStrategy(v) {
+  const dirLabel = { bull: '看多', bear: '看空', neutral: '中性' }
+  const lines = [`${v.code} 多空信号（${v.date}，收盘 ${v.close}）：综合判断【${v.overall}】（多 ${v.bull} / 空 ${v.bear}）`]
+  for (const s of v.signals) {
+    lines.push(`  ${dirLabel[s.direction] || ''} ${s.name}${s.note ? '：' + s.note : ''}`)
+  }
+  if (Array.isArray(v.states) && v.states.length > 0) {
+    lines.push('')
+    lines.push('── 6 种策略当前状态 ──')
+    let bullN = 0
+    let bearN = 0
+    for (const s of v.states) {
+      const tag = s.direction === 'bull' ? '🟢' : s.direction === 'bear' ? '🔴' : '⚪'
+      if (s.direction === 'bull') bullN++
+      else if (s.direction === 'bear') bearN++
+      lines.push(`  ${tag} ${s.name}：${s.state}${s.note ? '（' + s.note + '）' : ''}`)
+    }
+    lines.push(`  —— 策略共识：${bullN} 看多 / ${bearN} 看空 / ${v.states.length - bullN - bearN} 中性 ——`)
+  }
+  lines.push('注：技术信号仅作参考，不构成投资建议。')
+  return lines.join('\n')
+}
+
+function renderWatch(v) {
+  if (v.enabled === false && v.note && v.rules == null) return v.note
+  const lines = [`盯盘状态：${v.enabled ? '已开启' : '未开启'}`]
+  if (v.rules) lines.push(`规则：涨跌幅阈值 ±${v.rules.changePctThreshold ?? 3}%，放量 ${v.rules.volumeRatio ?? 2} 倍`)
+  if (v.watchlistCount != null) lines.push(`自选股 ${v.watchlistCount} 只`)
+  if (v.alertCount != null) lines.push(`累计告警 ${v.alertCount} 条`)
+  if (v.note) lines.push(v.note)
+  return lines.join('\n')
+}
+
+function renderAlerts(v) {
+  const alerts = v.alerts || []
+  const lines = [`盯盘告警（共 ${alerts.length} 条，最近在前）：`]
+  alerts.forEach((a, i) => {
+    const t = (a.ts || '').slice(0, 19).replace('T', ' ')
+    const pct = a.changePct != null ? ' ' + fmtPct(a.changePct) : ''
+    const price = a.price != null ? ' 现价' + a.price : ''
+    lines.push(`${i + 1}. [${t}] ${a.name}(${a.code}) ${a.message}${price}${pct}`)
+  })
+  if (alerts.length === 0) lines.push('（暂无告警）')
+  return lines.join('\n')
+}
