@@ -242,14 +242,14 @@ const sectionStyle: React.CSSProperties = {
   fontSize: 16, fontWeight: 600, margin: '20px 0 10px',
   borderTop: '1px solid rgba(128,128,128,.25)', paddingTop: 12,
 }
-// 三级标题：单个策略名（如「RSI 超卖反弹」）
+// 三级标题：单个策略名（如「RSI 超卖反弹」），颜色与正文一致
 const groupTitleStyle: React.CSSProperties = {
-  fontSize: 14, fontWeight: 600, margin: '12px 0 6px', color: '#8b7cf6',
+  fontSize: 14, fontWeight: 600, margin: '12px 0 6px', color: 'var(--dsw-alias-label-primary)',
 }
 const emptyHintStyle: React.CSSProperties = { color: '#888', fontSize: 13 }
-// 参数行：参数名（第三级，13px）
+// 参数行：参数名（第三级，13px），颜色与官方设置卡的小字体一致
 const rowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }
-const labelStyle: React.CSSProperties = { flex: 1, fontSize: 13, color: '#bbb' }
+const labelStyle: React.CSSProperties = { flex: 1, fontSize: 13, color: 'var(--dsw-alias-label-primary)' }
 const inputStyle: React.CSSProperties = {
   width: 140, padding: '5px 10px', borderRadius: 6,
   border: '1px solid rgba(128,128,128,.45)', background: 'rgba(128,128,128,.06)',
