@@ -19,7 +19,7 @@ Registers 21 model tools, a standalone **"Stock Assistant"** settings section, a
 | Quant | `screen` (multi-factor screener) `backtest` (6-strategy backtest) |
 | Watchlist & alerts | `watchlist_add` `watchlist_remove` `watchlist_show` `watch_start` `watch_stop` `watch_status` `watch_alerts` |
 
-The settings section (Settings → **Stock Assistant**) edits the watchlist, backtest/strategy parameters and alert thresholds; changes take effect immediately.
+The settings section (Settings → **Stock Assistant**) edits the watchlist, backtest/strategy parameters and alert thresholds; edits apply after clicking **Save** (bottom-right), and **Initialize** restores all defaults. Strategy parameters are grouped under per-strategy headings (e.g. "RSI 超卖反弹 / RSI mean reversion").
 
 ## Installation
 
@@ -106,7 +106,7 @@ A 股行情 / 热点 / 量化分析助手 —— [DeepSeek Harness](https://gith
 | 量化 | `screen`（多因子条件选股）`backtest`（6 策略回测） |
 | 自选·盯盘 | `watchlist_add` `watchlist_remove` `watchlist_show` `watch_start` `watch_stop` `watch_status` `watch_alerts` |
 
-设置页（设置 → **股票助手**）可编辑自选股、回测参数、策略参数与盯盘阈值，修改即时生效。
+设置页（设置 → **股票助手**）可编辑自选股、回测参数、策略参数与盯盘阈值；修改后点右下角「保存」生效，「初始化」恢复全部默认值。策略参数按策略分组显示（如「RSI 超卖反弹」小标题）。
 
 ## 安装
 
