@@ -4,6 +4,7 @@ import { quote, sectorList, limitUpPool, stockFlow, screenTop, lastTradingDates 
 import { kline } from './src/tencent.js'
 import * as ind from './src/indicators.js'
 import { backtest, strategySignals, strategyStates } from './src/quant.js'
+import { stockProfile } from './src/profile.js'
 import { runAkshare } from './src/akshare.js'
 import { stockNews } from './src/news.js'
 import { startWatcher } from './src/watch.js'
@@ -348,7 +349,7 @@ export function apply(ctx) {
   // ---------- 回测 ----------
   ctx.tools.register(defineTool({
     name: 'backtest',
-    description: '策略回测（简化）：基于前复权日线全仓进出，输出收益/回撤/胜率（不含手续费滑点）。支持 6 种策略：均线金叉/死叉、MACD、RSI 超卖反弹、KDJ、N日突破、布林带回归。',
+    description: '策略回测（简化）：基于前复权日线全仓进出，输出收益/回撤/胜率（不含手续费滑点）。支持 6 种策略：均线金叉/死叉、MACD、RSI 超卖反弹、KDJ、N日突破、布林带回归。不确定用哪种策略时，可先用 stock_profile 识别股性并获得策略推荐。',
     parameters: {
       code: { type: 'string', required: true, description: '6 位股票代码' },
       strategy: { type: 'string', enum: ['ma_cross', 'macd_cross', 'rsi_reversal', 'kdj_cross', 'breakout', 'boll_reversal'], description: '策略，默认 ma_cross' },
@@ -387,6 +388,24 @@ export function apply(ctx) {
       return { code, ...strategySignals(bars), states: strategyStates(bars) }
     },
     timeoutMs: 20000,
+  }))
+
+  // ---------- 股性识别 + 策略匹配 ----------
+  ctx.tools.register(defineTool({
+    name: 'stock_profile',
+    description: '识别个股股性（趋势型/波段型/震荡型、波动水平），并匹配适合该股性的交易策略，自动用推荐策略回测对比。在用户想了解或回测一只股票、又不确定用哪种策略时，先调用本工具判断股性并获取策略推荐；随后可用 backtest 按推荐策略回测。',
+    parameters: {
+      code: { type: 'string', required: true, description: '6 位股票代码' },
+      count: { type: 'integer', description: '分析 K 线根数，默认 250，最大 250' },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: renderProfile(v) }] },
+    execute: async (args) => {
+      const code = String(args.code).trim()
+      const count = Math.max(60, Math.min(args.count ?? 250, 250))
+      const bars = await kline(code, { period: 'day', count, fq: 'qfq' })
+      return { code, ...stockProfile(bars) }
+    },
+    timeoutMs: 30000,
   }))
 
   // ---------- 盯盘 ----------
@@ -444,7 +463,7 @@ export function apply(ctx) {
     execute: async (args) => ({ alerts: store.getAlerts(Math.max(1, Math.min(args.limit ?? 30, 200))) }),
   }))
 
-  console.log('[dsh-stock-assistant] 已注册工具: stock_quote, stock_kline, stock_indicators, sector_rank, sector_flow, limit_up_pool, watchlist_add, watchlist_remove, watchlist_show, stock_flow, dragon_tiger, stock_news, stock_finance, screen, backtest, strategy, watch_start, watch_stop, watch_status, watch_alerts')
+  console.log('[dsh-stock-assistant] 已注册工具: stock_quote, stock_kline, stock_indicators, sector_rank, sector_flow, limit_up_pool, watchlist_add, watchlist_remove, watchlist_show, stock_flow, dragon_tiger, stock_news, stock_finance, screen, backtest, strategy, stock_profile, watch_start, watch_stop, watch_status, watch_alerts')
 }
 
 // ---------------- render helpers ----------------
@@ -626,6 +645,30 @@ function renderStrategy(v) {
     lines.push(`  —— 策略共识：${bullN} 看多 / ${bearN} 看空 / ${v.states.length - bullN - bearN} 中性 ——`)
   }
   lines.push('注：技术信号仅作参考，不构成投资建议。')
+  return lines.join('\n')
+}
+
+function renderProfile(v) {
+  const c = v.character
+  const styleLabel = { trend: '趋势跟随', swing: '波段', range: '均值回归' }
+  const m = c.metrics
+  const lines = [
+    `${v.code} 股性识别（${v.start} ~ ${v.end}，近 ${v.window} 根日线）`,
+    `股性：${c.label}（偏好风格：${styleLabel[c.style] || c.style}）`,
+    `  年化波动率 ${m.volatility}%  趋势拟合 R² ${m.trendR2}  年化对数趋势 ${m.trendAnnual}%`,
+    `  收益自相关 ${m.returnAutocorr}  均线多头占比 ${(m.maAlignment * 100).toFixed(0)}%  窗口最大回撤 ${m.maxDrawdown}%  布林带宽 ${m.bollWidth}%`,
+  ]
+  for (const note of c.notes) lines.push(`  · ${note}`)
+  lines.push('')
+  lines.push(`推荐策略（匹配度排序，前 ${v.strategies.length} 个）：`)
+  v.strategies.forEach((s, i) => {
+    const b = s.backtest
+    lines.push(`${i + 1}. ${s.name}（${s.key}）匹配度 ${s.score} —— ${s.reason}`)
+    lines.push(`   回测：总收益 ${b.totalReturn}%  年化 ${b.annualizedReturn}%  最大回撤 ${b.maxDrawdown}%  交易 ${b.tradeCount} 次  胜率 ${b.winRate}%`)
+  })
+  lines.push('')
+  lines.push(`建议：${v.suggestion}`)
+  lines.push('注：股性识别基于历史统计，策略匹配为启发式打分；简化回测不含手续费/滑点，仅供参考，不构成投资建议。')
   return lines.join('\n')
 }
 

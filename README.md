@@ -8,11 +8,12 @@ Data sources: Eastmoney public endpoints (quotes, sectors, limit-up pool, money 
 
 ## Features
 
-Registers 20 model tools, a standalone **"Stock Assistant"** settings section, and watch alerts (session log + Windows toast notifications).
+Registers 21 model tools, a standalone **"Stock Assistant"** settings section, and watch alerts (session log + Windows toast notifications).
 
 | Category | Tools |
 |---|---|
 | Quotes & analysis | `stock_quote` `stock_kline` `stock_indicators` `strategy` |
+| Personality & strategy | `stock_profile` (stock personality recognition + strategy matching + auto backtest) |
 | Hotspots | `sector_rank` `sector_flow` `limit_up_pool` `dragon_tiger` |
 | Flow, finance & news | `stock_flow` `stock_finance` `stock_news` |
 | Quant | `screen` (multi-factor screener) `backtest` (6-strategy backtest) |
@@ -55,6 +56,7 @@ pnpm dsh plugin --profile web add <path-to>/dsh-stock-assistant
 Add stocks to the watchlist (via chat tools or the settings section), then:
 
 - Quotes & signals: `stock_quote 600000`, `stock_kline 000001`, `strategy 300750`
+- Personality first: `stock_profile 600000` (recognizes the stock's character and recommends matched strategies, with backtests)
 - Hotspots: `sector_rank`, `limit_up_pool`, `dragon_tiger`
 - Backtests: `backtest 600519 strategy ma_cross`
 - Alerts: `watch_start` (polls the watchlist every 30 s; alerts on moves, limit up/down and volume spikes), `watch_alerts` to read the log
@@ -62,12 +64,13 @@ Add stocks to the watchlist (via chat tools or the settings section), then:
 ## Project layout
 
 ```
-├── index.js                # host entry: registers 20 tools + settings namespace `stock-assistant`
+├── index.js                # host entry: registers 21 tools + settings namespace `stock-assistant`
 ├── src/                    # data / quant / watch / config (plain ESM JS)
 │   ├── eastmoney.js        # Eastmoney HTTP: quotes, sectors, limit-up pool, money flow
 │   ├── tencent.js          # Tencent adjusted K-lines
 │   ├── akshare.js          # Python subprocess JSON-RPC (dragon-tiger list, financials)
 │   ├── quant.js            # 6-strategy backtest + signal dashboard
+│   ├── profile.js          # stock personality recognition + strategy matching
 │   ├── watch.js store.js notify.js
 │   └── client/             # settings section (TSX, built with tsdown)
 │       └── SettingsCard.tsx
@@ -92,11 +95,12 @@ A 股行情 / 热点 / 量化分析助手 —— [DeepSeek Harness](https://gith
 
 ## 功能
 
-注册 20 个模型工具、一个独立设置页 **「股票助手」**、盯盘告警（会话日志 + Windows 桌面气泡通知）。
+注册 21 个模型工具、一个独立设置页 **「股票助手」**、盯盘告警（会话日志 + Windows 桌面气泡通知）。
 
 | 分类 | 工具 |
 |---|---|
 | 行情分析 | `stock_quote` `stock_kline` `stock_indicators` `strategy` |
+| 股性识别 | `stock_profile`（股性识别 + 策略匹配 + 自动回测推荐策略） |
 | 热点 | `sector_rank` `sector_flow` `limit_up_pool` `dragon_tiger` |
 | 资金·财务·新闻 | `stock_flow` `stock_finance` `stock_news` |
 | 量化 | `screen`（多因子条件选股）`backtest`（6 策略回测） |
@@ -139,6 +143,7 @@ pnpm dsh plugin --profile web add <path-to>/dsh-stock-assistant
 把股票加入自选（对话里用工具或设置页都行），然后：
 
 - 问行情：`stock_quote 600000`、`stock_kline 000001`、`strategy 300750`
+- 先看股性：`stock_profile 600000`（识别股性并推荐匹配策略，附带自动回测对比）
 - 看热点：`sector_rank`、`limit_up_pool`、`dragon_tiger`
 - 做回测：`backtest 600519 strategy ma_cross`
 - 开盯盘：`watch_start`（30 秒轮询自选股，异动/涨停/放量告警），`watch_alerts` 看日志
@@ -146,12 +151,13 @@ pnpm dsh plugin --profile web add <path-to>/dsh-stock-assistant
 ## 项目结构
 
 ```
-├── index.js                # 宿主入口：注册 20 个工具 + settings 命名空间 stock-assistant
+├── index.js                # 宿主入口：注册 21 个工具 + settings 命名空间 stock-assistant
 ├── src/                    # 数据/量化/盯盘/配置（纯 ESM JS）
 │   ├── eastmoney.js        # 东财 HTTP：行情/板块/涨停池/资金流
 │   ├── tencent.js          # 腾讯前复权 K 线
 │   ├── akshare.js          # Python 子进程 JSON-RPC（龙虎榜/财务）
 │   ├── quant.js            # 6 策略回测 + 多空信号
+│   ├── profile.js          # 股性识别 + 策略匹配
 │   ├── watch.js store.js notify.js
 │   └── client/             # 设置页（TSX，tsdown 构建）
 │       └── SettingsCard.tsx
